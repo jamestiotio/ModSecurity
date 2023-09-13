@@ -1,6 +1,6 @@
 /*
  * ModSecurity, http://www.modsecurity.org/
- * Copyright (c) 2015 - 2021 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+ * Copyright (c) 2015 - 2023 Trustwave Holdings, Inc. (http://www.trustwave.com/)
  *
  * You may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
@@ -21,6 +21,7 @@
 
 #include <string>
 #include <memory>
+#include <chrono>
 
 #include <pthread.h>
 
@@ -34,6 +35,7 @@ namespace modsecurity {
 namespace collection {
 namespace backend {
 
+static const std::string expiry_key_prefix = "__expire_";
 
 #ifdef WITH_LMDB
 
@@ -150,6 +152,57 @@ void LMDB::lmdb_debug(int rc, const std::string &op, const std::string &scope) {
 #endif
 }
 
+bool LMDB::isExpiredKey(MDB_txn *txn, MDB_val key) {
+    MDB_val mdb_expiry_key;
+    MDB_val mdb_expiry_value;
+
+    std::string expireTimeKey(expiry_key_prefix);
+    expireTimeKey.append(reinterpret_cast<char *>(key.mv_data), key.mv_size);
+
+    string2val(expireTimeKey, &mdb_expiry_key);
+
+    int rc = mdb_get(txn, m_dbi, &mdb_expiry_key, &mdb_expiry_value);
+    lmdb_debug(rc, "get", "isExpiredKey");
+    if (rc != 0) {
+	return false;
+    } else {
+        std::string expiryTime(reinterpret_cast<char *>(mdb_expiry_value.mv_data), mdb_expiry_value.mv_size);
+	if (isExpiredTime(expiryTime)) {
+	    return true;
+	} else {
+	    return false;
+	}
+    }
+}
+
+bool LMDB::isExpiryKey(MDB_val key) {
+    char* testKey = reinterpret_cast<char *>(key.mv_data);
+    if (strncmp(testKey, expiry_key_prefix.c_str(), expiry_key_prefix.length()) == 0) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+bool LMDB::isExpiredTime(const std::string& expiryValue) {
+    if (expiryValue.empty()) {
+        return false;
+    }
+    if (expiryValue.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
+
+    std::chrono::system_clock::time_point nowTime = std::chrono::system_clock::now();
+    uint64_t nowEpochSeconds = std::chrono::duration_cast<std::chrono::seconds>(nowTime.time_since_epoch()).count();
+
+    uint64_t expiryEpochSeconds = strtoll(expiryValue.c_str(), NULL, 10);
+    if (nowEpochSeconds >= expiryEpochSeconds) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
 
 std::unique_ptr<std::string> LMDB::resolveFirst(const std::string& var) {
     int rc;
@@ -158,6 +211,7 @@ std::unique_ptr<std::string> LMDB::resolveFirst(const std::string& var) {
     MDB_val mdb_value_ret;
     std::unique_ptr<std::string> ret = NULL;
     MDB_txn *txn = NULL;
+    bool valExpired = false;
 
     string2val(var, &mdb_key);
 
@@ -172,13 +226,21 @@ std::unique_ptr<std::string> LMDB::resolveFirst(const std::string& var) {
         goto end_get;
     }
 
-    ret = std::unique_ptr<std::string>(new std::string(
-        reinterpret_cast<char *>(mdb_value_ret.mv_data),
-        mdb_value_ret.mv_size));
+    if (isExpiredKey(txn, mdb_key)) {
+        valExpired = true;
+    } else {
+        ret = std::unique_ptr<std::string>(new std::string(
+            reinterpret_cast<char *>(mdb_value_ret.mv_data),
+            mdb_value_ret.mv_size));
+    }
 
 end_get:
     mdb_txn_abort(txn);
 end_txn:
+    // The read-only transaction is complete. Now we can do a delete if the item was expired
+    if (valExpired) {
+        delIfExpired(var);
+    }
     return ret;
 }
 
@@ -193,7 +255,6 @@ bool LMDB::storeOrUpdateFirst(const std::string &key,
 
     string2val(key, &mdb_key);
     string2val(value, &mdb_value);
-
     rc = txn_begin(0, &txn);
     lmdb_debug(rc, "txn", "storeOrUpdateFirst");
     if (rc != 0) {
@@ -229,6 +290,7 @@ end_del:
     }
 end_commit:
 end_txn:
+
     return true;
 }
 
@@ -241,6 +303,7 @@ void LMDB::resolveSingleMatch(const std::string& var,
     MDB_val mdb_value;
     MDB_val mdb_value_ret;
     MDB_cursor *cursor;
+    std::list<std::string> expiredVars;
 
     rc = txn_begin(MDB_RDONLY, &txn);
     lmdb_debug(rc, "txn", "resolveSingleMatch");
@@ -253,16 +316,26 @@ void LMDB::resolveSingleMatch(const std::string& var,
     mdb_cursor_open(txn, m_dbi, &cursor);
     while ((rc = mdb_cursor_get(cursor, &mdb_key,
             &mdb_value_ret, MDB_NEXT_DUP)) == 0) {
-        std::string *a = new std::string(
-            reinterpret_cast<char *>(mdb_value_ret.mv_data),
-            mdb_value_ret.mv_size);
-        VariableValue *v = new VariableValue(&var, a);
-        l->push_back(v);
+        if (isExpiryKey(mdb_key)) {
+            continue;
+        }
+        if (isExpiredKey(txn, mdb_key)) {
+            expiredVars.push_back(std::string(reinterpret_cast<char *>(mdb_key.mv_data), mdb_key.mv_size));
+        } else {
+            std::string *a = new std::string(
+                reinterpret_cast<char *>(mdb_value_ret.mv_data),
+                mdb_value_ret.mv_size);
+            VariableValue *v = new VariableValue(&var, a);
+            l->push_back(v);
+        }
     }
 
     mdb_cursor_close(cursor);
     mdb_txn_abort(txn);
 end_txn:
+    for (const auto& expiredVar : expiredVars) {
+        delIfExpired(expiredVar);
+    }
     return;
 }
 
@@ -402,8 +475,71 @@ end_txn:
     return;
 }
 
+void LMDB::delIfExpired(const std::string& key) {
+    MDB_txn *txn;
+    MDB_val mdb_key;
+    MDB_val mdb_value_ret;
+    MDB_val mdb_expire_key;
+    MDB_val mdb_expire_value_ret;
+
+    std::string expireTimeKey = expiry_key_prefix + key;
+
+    int rc = txn_begin(0, &txn);
+    lmdb_debug(rc, "txn", "del");
+    if (rc != 0) {
+        goto end_txn;
+    }
+
+    string2val(key, &mdb_key);
+
+    rc = mdb_get(txn, m_dbi, &mdb_key, &mdb_value_ret);
+    lmdb_debug(rc, "get", "del");
+    if (rc != 0) {
+        goto end_get;
+    }
+
+    if (isExpiredKey(txn, mdb_key)) {
+        rc = mdb_del(txn, m_dbi, &mdb_key, &mdb_value_ret);
+        lmdb_debug(rc, "del", "del");
+        if (rc != 0) {
+            goto end_del;
+        }
+        string2val(expireTimeKey, &mdb_expire_key);
+        rc = mdb_get(txn, m_dbi, &mdb_expire_key, &mdb_expire_value_ret);
+        lmdb_debug(rc, "get", "del");
+        if (rc != 0) {
+            goto end_get;
+        }
+        rc = mdb_del(txn, m_dbi, &mdb_expire_key, &mdb_expire_value_ret);
+        lmdb_debug(rc, "del", "del");
+        if (rc != 0) {
+            goto end_del;
+        }
+    }
+
+    rc = mdb_txn_commit(txn);
+    lmdb_debug(rc, "commit", "del");
+    if (rc != 0) {
+        goto end_commit;
+    }
+
+end_del:
+end_get:
+    if (rc != 0) {
+        mdb_txn_abort(txn);
+    }
+end_commit:
+end_txn:
+    return;
+}
+
 void LMDB::setExpiry(const std::string& key, int32_t expiry_seconds) {
-    // TODO: add implementation
+    std::string expireTimeKey = expiry_key_prefix + key;
+
+    std::chrono::system_clock::time_point expiryTime = std::chrono::system_clock::now() + std::chrono::seconds(expiry_seconds);
+    uint64_t expiryEpochSeconds = std::chrono::duration_cast<std::chrono::seconds>(expiryTime.time_since_epoch()).count();
+
+    storeOrUpdateFirst(expireTimeKey, std::to_string(expiryEpochSeconds));
 }
 
 void LMDB::resolveMultiMatches(const std::string& var,
@@ -415,6 +551,7 @@ void LMDB::resolveMultiMatches(const std::string& var,
     MDB_stat mst;
     size_t keySize = var.size();
     MDB_cursor *cursor;
+    std::list<std::string> expiredVars;
 
     rc = txn_begin(MDB_RDONLY, &txn);
     lmdb_debug(rc, "txn", "resolveMultiMatches");
@@ -430,17 +567,12 @@ void LMDB::resolveMultiMatches(const std::string& var,
 
     if (keySize == 0) {
         while ((rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT)) == 0) {
-            l->insert(l->begin(), new VariableValue(
-                &m_name,
-                new std::string(reinterpret_cast<char *>(key.mv_data),
-                key.mv_size),
-                new std::string(reinterpret_cast<char *>(data.mv_data),
-                data.mv_size)));
-        }
-    } else {
-        while ((rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT)) == 0) {
-            char *a = reinterpret_cast<char *>(key.mv_data);
-            if (strncmp(var.c_str(), a, keySize) == 0) {
+            if (isExpiryKey(key)) {
+                continue;
+            }
+            if (isExpiredKey(txn, key)) {
+                expiredVars.push_back(std::string(reinterpret_cast<char *>(key.mv_data), key.mv_size));
+            } else {
                 l->insert(l->begin(), new VariableValue(
                     &m_name,
                     new std::string(reinterpret_cast<char *>(key.mv_data),
@@ -449,12 +581,34 @@ void LMDB::resolveMultiMatches(const std::string& var,
                     data.mv_size)));
             }
         }
+    } else {
+        while ((rc = mdb_cursor_get(cursor, &key, &data, MDB_NEXT)) == 0) {
+            if (isExpiryKey(key)) {
+                continue;
+            }
+            char *a = reinterpret_cast<char *>(key.mv_data);
+            if (strncmp(var.c_str(), a, keySize) == 0) {
+                if (isExpiredKey(txn, key)) {
+                    expiredVars.push_back(std::string(reinterpret_cast<char *>(key.mv_data), key.mv_size));
+                } else {
+                    l->insert(l->begin(), new VariableValue(
+                        &m_name,
+                        new std::string(reinterpret_cast<char *>(key.mv_data),
+                        key.mv_size),
+                        new std::string(reinterpret_cast<char *>(data.mv_data),
+                        data.mv_size)));
+		}
+            }
+        }
     }
 
     mdb_cursor_close(cursor);
 end_cursor_open:
     mdb_txn_abort(txn);
 end_txn:
+    for (const auto& expiredVar : expiredVars) {
+        delIfExpired(expiredVar);
+    }
     return;
 }
 
@@ -467,6 +621,7 @@ void LMDB::resolveRegularExpression(const std::string& var,
     int rc;
     MDB_stat mst;
     MDB_cursor *cursor;
+    std::list<std::string> expiredVars;
 
     Utils::Regex r(var, true);
 
@@ -488,23 +643,33 @@ void LMDB::resolveRegularExpression(const std::string& var,
         if (ret <= 0) {
             continue;
         }
+        if (isExpiryKey(key)) {
+            continue;
+	}
         if (ke.toOmit(std::string(reinterpret_cast<char *>(key.mv_data),
                 key.mv_size))) {
             continue;
         }
 
-        VariableValue *v = new VariableValue(
-            new std::string(reinterpret_cast<char *>(key.mv_data),
-                key.mv_size),
-            new std::string(reinterpret_cast<char *>(data.mv_data),
-                data.mv_size));
-        l->insert(l->begin(), v);
+        if (isExpiredKey(txn, key)) {
+            expiredVars.push_back(std::string(reinterpret_cast<char *>(key.mv_data), key.mv_size));
+        } else {
+            VariableValue *v = new VariableValue(
+                new std::string(reinterpret_cast<char *>(key.mv_data),
+                    key.mv_size),
+                new std::string(reinterpret_cast<char *>(data.mv_data),
+                    data.mv_size));
+            l->insert(l->begin(), v);
+        }
     }
 
     mdb_cursor_close(cursor);
 end_cursor_open:
     mdb_txn_abort(txn);
 end_txn:
+    for (const auto& expiredVar : expiredVars) {
+        delIfExpired(expiredVar);
+    }
     return;
 }
 

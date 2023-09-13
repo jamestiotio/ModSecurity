@@ -1,6 +1,6 @@
 /*
  * ModSecurity, http://www.modsecurity.org/
- * Copyright (c) 2015 - 2021 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+ * Copyright (c) 2015 - 2023 Trustwave Holdings, Inc. (http://www.trustwave.com/)
  *
  * You may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
@@ -125,6 +125,11 @@ class LMDB :
     int txn_begin(unsigned int flags, MDB_txn **ret);
     void string2val(const std::string& str, MDB_val *val);
     void inline lmdb_debug(int rc, const std::string &op, const std::string &scope);
+    bool isExpiredKey(MDB_txn *txn, MDB_val key);
+    bool isExpiryKey(MDB_val key);
+    bool isExpiredTime(const std::string& expiryValue);
+
+    void delIfExpired(const std::string& key);
 
     MDB_env *m_env;
     MDB_dbi m_dbi;
